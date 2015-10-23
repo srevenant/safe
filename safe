@@ -1,0 +1,699 @@
+#!/usr/bin/env python
+# vim modeline (put ":set modeline" into your ~/.vimrc)
+# vim:set expandtab ts=4 sw=4 ai:
+#
+# Safe manages secure documents for you, stored centrally, and versioned
+# It is used differently depending upon what you desire to do:
+#
+# Copyright (C) 2015 Brandon Gillespie
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+from __future__ import print_function # get around old stupidity
+import io
+import os
+import os.path
+import stat # chmod
+import sys
+import argparse
+import json
+import re
+import pprint
+from Crypto.Cipher import AES
+from Crypto import Random
+from hashlib import md5, sha256
+import base64
+import boto
+from boto.s3.key import Key
+import time
+import platform # for node/hostname
+import getpass # for local username
+import StringIO
+import tempfile
+import signal
+import sys
+import subprocess
+import atexit # shutdown hooks
+import shutil # rm -rf (rmtree)
+import uuid
+#import gnupg
+from cryptography.fernet import Fernet,MultiFernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+################################################################
+# TODO: cleanup the odd case that we have something left over?
+
+################################################################
+class Core():
+    debug = {}
+    timestamp = False
+
+    ############################################################
+    def TSTAMP(self):
+        """Create a uniform timestamp"""
+        return time.strftime('%Y%m%d%H%M%S')
+
+    ############################################################
+    def NOTICE(self, msg):
+        """Internal print wrapper, so it can be easily overloaded--Notice is for human readable"""
+        if self.timestamp:
+            sys.stderr.write(self.TSTAMP() + " " +  msg + "\n")
+        else:
+            sys.stderr.write(msg + "\n")
+
+    ############################################################
+    def OUTPUT(self, msg):
+        """Internal print wrapper, so it can be easily overloaded--OUTPUT is for machine readable"""
+        if self.timestamp:
+            sys.stdout.write(self.TSTAMP() + " " +  msg + "\n")
+        else:
+            sys.stdout.write(msg + "\n")
+
+    ############################################################
+    def DEBUG(self, msg, module="basic", data=None, err=None):
+        """Debugging of output, supporting levels and modules"""
+        debug = self.debug or {}
+        if module in debug.keys():
+            if err:
+                msg = msg + ": " + str(err)
+            self.NOTICE("DEBUG: " + module + "." + msg)
+            if data:
+                sys.stderr.write(pprint.pformat(data, indent=1, width=80, depth=None))
+
+    ############################################################
+    def ABORT(self, msg, err=None):
+        if err:
+            self.DEBUG("Error", err=err)
+        self.NOTICE("ABORT: " + msg)
+        if err and err.strerror:
+            self.NOTICE(str(err))
+
+        sys.exit(1)
+
+################################################################
+#def add(self, cfg, name, salt=None, password=None):
+#    cfg['files'][name] = {
+#        'password': base64.b64encode(password or ''),
+#        'salt': salt or base64.b64encode(os.urandom(16))
+#    }
+
+class Cipher(Core):
+    versions = {
+        '01': {'type':Fernet, 'blocksize': AES.block_size*1024}
+    }
+    key = ''
+    bs = 0
+    cipher = None
+
+    def _prep(self, key, orig=None):
+        if orig:
+            v = orig[:2]
+        else:
+            v = '01'
+
+        self.bs = self.versions[v]['blocksize']
+        self.key = key
+        self.cipher = self.versions[v]['type'](self.key)
+        return self
+
+    def new_key(self):
+        return Fernet.generate_key()
+
+    def encrypt(self, block):
+        if self.cipher:
+            return self.cipher.encrypt(block)
+        else:
+            raise ValueError("self.cipher is not initialized")
+
+    def encrypt_file(self, key, in_file, out_file):
+        self._prep(key)
+        out_file.write('01')
+        for block in self._read_block(in_file, self.bs):
+            # it comes at us base64 encoded
+            out_file.write(self.cipher.encrypt(block))
+            out_file.write("\n")
+
+    def decrypt(self, block):
+        if self.cipher:
+            return self.cipher.decrypt(block)
+        else:
+            raise ValueError("self.cipher is not initialized")
+
+    def decrypt_file(self, key, in_file, out_file):
+        first = in_file.read(2)
+        self._prep(key, orig=first)
+        # it comes in base64 encoded, so just read "a line"
+        for block in in_file: # self._read_block(in_file, self.bs):
+            out_file.write(self.cipher.decrypt(block))
+
+    def _read_block(self, read_file, bs):
+        while True:
+            data = read_file.read(bs)
+            if not data:
+                break
+            yield data
+
+################################################################
+class Base(Cipher):
+    """Base object where common and global attributes are defined"""
+    cfg_path = os.environ['HOME'] + '/.safe'
+    cfg_secret = os.environ['HOME'] + '/.safe.s'
+    cfg = {'files':{}}
+    session = str(uuid.uuid1())
+    try:
+        # need a universal way to pull a common secret tied to the local user
+        # session, after they are authenticated.  Something better than this.
+        with open(cfg_secret, 'rt') as in_file:
+            config_key = base64.b64encode(in_file.read(32))
+    except Exception, e:
+        print("ABORT: Unable to load secret seed--did you initialize?")
+        print("try: dd if=/dev/urandom bs=32 count=1 of=~/.safe.s")
+        sys.exit(1)
+
+    ############################################################
+    # find an executable
+    def _which(self, cmd):
+        for path in os.environ["PATH"].split(os.pathsep):
+            full_cmd = os.path.join(path, cmd)
+            if os.path.exists(full_cmd):
+                return full_cmd
+
+    ############################################################
+    def __reference__(self, reference):
+        """Copy across vars from a previously initialized object"""
+        self.debug = reference.debug
+        self.cfg = reference.cfg
+        self.timestamp = reference.timestamp
+        self.hostname = reference.hostname
+        self.user = reference.user
+        self.editor = reference.editor
+        self.homedir = reference.homedir
+        self.session = reference.session
+
+    ############################################################
+    # python class inheritance and instantiation is brain-dead
+    # break out our class Init so we can bypass super()
+    def __init__(self, debug=[]):
+        self.__init_Base__(debug)
+
+    def __init_Base__(self, debug=[]):
+        if debug:
+            for module in debug:
+                self.debug[module] = True
+        self.hostname = platform.node()
+        self.homedir = os.path.expanduser("~")
+        if 'SUDO_USER' in os.environ.keys():
+            self.user = os.environ['SUDO_USER']
+        else:
+            self.user = getpass.getuser()
+        if 'EDITOR' in os.environ.keys():
+            self.editor = os.environ['EDITOR']
+        else:
+            for e in 'vim', 'vi', 'nano':
+                p = self._which(e)
+                if p:
+                    self.editor = p
+                    break
+
+    ############################################################
+    def StringIO(self):
+        # because python 2.x does unicode with io.StringIO
+        if sys.version_info[0] < 3:
+            return StringIO.StringIO()
+        else:
+            return io.StringIO()
+
+    ############################################################
+    def cfg_load(self):
+        """Load state config data"""
+        try:
+            self.DEBUG("Config Load:", data=self.cfg, module='config')
+            if os.path.exists(self.cfg_path):
+                decrypted_file = io.BytesIO()
+                with open(self.cfg_path, 'rt') as in_file:
+                    self.decrypt_file(self.config_key, in_file, decrypted_file)
+                    decrypted_file.seek(0)
+                    self.cfg = json.load(decrypted_file)
+            else:
+                self.DEBUG("No safe config", module='config')
+
+        except Exception, e:
+            self.NOTICE("Unable to load config!")
+            self.DEBUG("Reason: " + str(e))
+        return self
+
+    ############################################################
+    def cfg_save(self):
+        """Save config to file"""
+        decrypted_file = io.BytesIO()
+        decrypted_file.write(json.dumps(self.cfg))
+        decrypted_file.seek(0)
+        try:
+            with open(self.cfg_path, 'wb') as out_file:
+               self.encrypt_file(self.config_key, decrypted_file, out_file)
+        except Exception, e:
+            self.NOTICE("Unable to save config!")
+            self.NOTICE("Reason: " + str(e))
+
+################################################################
+class remoteFile(Base):
+
+    ############################################################
+    def __init__(self, base, debug=[]):
+        """instantiate with key and secret)"""
+        # this object is always called as a reference to Base,
+        # not a direct inheritor
+        base and self.__reference__(base)
+        self.opened = {}
+
+    ############################################################
+    def connect(self, name):
+        self.DEBUG("connect(" + name + ")", module="remoteFile")
+        if not name in self.opened.keys():
+            if not name in self.cfg['files'].keys():
+                self.ABORT("Undefined file '" + name + "'")
+            rdef = self.cfg['files'][name]['remote']
+            # here would be if rdef['type'] == s3
+            self.DEBUG("connect(" + name + "<" + rdef['key'] + "@" + rdef['bucket'] + ">)",
+                       module="remoteFile")
+            s3_debug = "s3" in self.debug.keys() and "http" in self.debug.keys()
+            s3_conn = boto.connect_s3(rdef['key'], rdef['secret'], debug=s3_debug, is_secure=True)
+            s3_bucket = s3_conn.get_bucket(rdef['bucket'])
+            self.opened[name] = {
+                's3_conn' : s3_conn,
+                's3_bucket' : s3_bucket,
+            }
+        return self.opened[name]['s3_bucket']
+
+    ############################################################
+    def key(self, key_name, fname=None):
+        self.DEBUG("key(" + key_name + ", fname=" + str(fname) + ")", module="remoteFile")
+        if not fname:
+            fname = key_name
+        key = Key(self.connect(key_name))
+        key.key = fname
+        return key
+
+    ############################################################
+    def delete(self, name, key_name):
+        """receive a complete name,version key and delete it"""
+        self.DEBUG("delete(" + name + ", " + key_name + ")", module="remoteFile")
+        bucket = self.connect(name)
+        result = bucket.delete_key(key_name)
+
+    ############################################################
+    def get(self, name, key_name, local_file, version=None):
+        """Download version of config from s3 bucket"""
+        self.DEBUG("get(" + name + ", " + key_name + ")", module="remoteFile")
+        key = self.key(name, fname=self.full_path(name, fname=key_name))
+        efile = local_file + ",e"
+        key.get_contents_to_file(efile)
+        # decrypt
+
+    ############################################################
+    def put(self, name, source_file, force=False, lock=True):
+        """Upload a new config to s3"""
+        if not len(name):
+            self.ABORT("Cannot put without a name")
+        self.DEBUG("put({n}, fd, force={f}, lock={l}".format(n=name,f=force,l=lock),
+                   module="remoteFile")
+        if lock:
+            try:
+                self.lock_acquire(name, force=force)
+            except Exception, e:
+                self.ABORT(str(e))
+
+        source_file.seek(0)
+        vers_name = name + "," + self.TSTAMP() + "," + self.session
+        key = self.key(name, fname=self.full_path(name, fname=vers_name))
+        self.DEBUG("put(" + name + " as " + key.key + ")", module="remoteFile")
+        # encrypt it
+        efile = source_file + ",e"
+        #
+        key.set_contents_from_file(fp=efile, replace=False)
+        self.clean_old(name)
+        if lock:
+            self.lock_release(name)
+
+    ############################################################
+    def clean_old(self, name):
+        # TODO: make sure only .e files are left behind on local disk
+        self.DEBUG("clean_old(" + name + ")", module="remoteFile")
+        names = self.list_names(name)
+        while len(names) > self.cfg['files'][name]['versions']:
+            self.NOTICE("Cleaning old version: " + names[0].split(',')[1])
+            self.delete(name, names[0])
+            names = self.list_names(name)
+        # TODO: cleanup local files too
+
+    ############################################################
+    def lock_name(self, target):
+        self.DEBUG("lock_name(" + target + ")", module="remoteFile")
+        rdef = self.cfg['files'][target]['remote']
+        return rdef['path'] + '/lock:' + target
+
+    ############################################################
+    def lock_release(self, target):
+        """Release a lock"""
+        self.DEBUG("lock_release(" + target + ")", module="remoteFile")
+        self.delete(target, self.lock_name(target))
+
+    ############################################################
+    def lock_acquire(self, target, force=False):
+        """Acquire a lock"""
+        self.DEBUG("lock_acquire(" + target + ", force=" + str(force) + ")",
+                   module="remoteFile")
+        key = self.key(target, fname=self.lock_name(target))
+        if force:
+            return self.lock_set(key, force=force)
+
+        try:
+            lockfile = self.StringIO()
+            key.get_contents_to_file(lockfile)
+            lockfile.seek(0)
+            lock = lockfile.read().split('\t')
+            # also allow it if the session matches
+            if len(lock) == 3 and lock[2] == self.session:
+                return True
+        except Exception, e:
+            return self.lock_set(key)
+
+        raise ValueError("File (" + target + ") is currently locked by " +
+                         lock[1] + " on " + lock[0])
+
+    ############################################################
+    def lock_set(self, key, force=False):
+        """Set a lock--do not check to see if it exists first; called by lock_acquire()"""
+        self.DEBUG("lock_set(" + key.name + ", force=" + str(force) + ")",
+                   module="remoteFile")
+        lockfile = self.StringIO()
+        lockfile.write(self.hostname + '\t' + self.user + '\t' + self.session)
+        lockfile.seek(0)
+        if not key.set_contents_from_file(fp=lockfile, replace=force):
+            raise ValueError("Failed to lock(" + key.name + "): already exists")
+        return True
+
+    ############################################################
+    def full_path(self, name, fname=None):
+        """Return a fully qualified path, with our base path"""
+        self.DEBUG("full_path(" + name + ", fname=" + str(fname) + ")", module="remoteFile")
+        path = self.cfg['files'][name]['remote']['path']
+        if not fname:
+            fname = name
+        if re.match("^" + path + "/+(.*)$", fname):
+            return fname
+        elif path == '/':
+            path = ''
+        return path + '/' + fname
+
+    ############################################################
+    def format_list(self, list, detailed=True):
+        self.DEBUG("format_list()", module="remoteFile")
+        out = []
+        for v in list:
+            if detailed:
+                name = v.name
+            else:
+                name = v
+            split = name.split('/')[-1].split(',')
+            date = split[1]
+            uuid = split[2]
+            s = "    " + split[1] + " " + split[2]
+            if detailed:
+                s += "  " + v.last_modified
+            out.append(s)
+        return out
+
+    ############################################################
+    def list(self, name, prefix=None):
+        self.DEBUG("list(" + name + ", prefix=" + str(prefix) + ")", module="remoteFile")
+        bucket = self.connect(name)
+        prefix = self.cfg['files'][name]['remote']['path']
+#        prefix = self.full_path(prefix)
+        #self.DEBUG("list(prefix=" + str(prefix) + ")", module="remoteFile")
+        return bucket.list(prefix=prefix)
+
+    ############################################################
+    def list_names(self, name, filter=None, details=False):
+        self.DEBUG("list_names(" + name + ", filter=" + str(filter) + ")", module="remoteFile")
+        path = self.full_path(name)
+        rx = re.compile(path + ",([0-9]{14}|[0-9_:-]{19}),.*$")
+        # because other stuff could creep in and mess it up
+        # iterate and inspect each one
+        matched = []
+        for e in self.list(name):#, prefix=name):
+            if rx.match(e.name):
+                if not filter or filter in e.name:
+                    if details:
+                        matched.append(e)
+                    else:
+                        matched.append(str(e.name))
+        return sorted(matched)
+
+################################################################
+class CLI(Base):
+    def __init__(self, base=None, debug=None):
+        # work around brain dead python class inheritance
+        self.__init_Base__(debug)
+
+    ############################################################
+    def config_print_cli(self):
+        """dump the config"""
+        altcfg = self.cfg
+        for e in altcfg['files']:
+            if 'secret' in altcfg['files'][e]['remote'].keys():
+                altcfg['files'][e]['remote']['secret'] = 'xxxxxxxxxxxxxxx'
+        self.NOTICE(json.dumps(altcfg, indent=2))
+
+    ############################################################
+    def list_cli(self):
+        """CLI Interface -- list files"""
+        remote = remoteFile(self)
+        for name in self.cfg['files'].keys():
+#            for e in remote.list_names(name, details=True):
+#                print(e.name + " " + e.last_modified)
+            map(self.NOTICE, remote.format_list(remote.list_names(name, details=True),
+                                                detailed=True))
+
+    ############################################################
+    def config_cli(self, name, path=None, force=False, encoder=None, key=None, versions=None, remote=None):
+        if not force and name in self.cfg['files'].keys():
+            self.ABORT("File '" + name + "' is already defined, specify --force to override")
+        if name in self.cfg['files'].keys():
+            default = self.cfg['files'][name]
+        else:
+            if not encoder:
+                encoder = 'gpg'
+            if not versions:
+                versions = 50
+            default = {
+                'encoder':encoder,
+                'key':key,
+                'versions':versions,
+            }
+        if encoder:
+            default['encoder'] = encoder
+        if key:
+            default['key'] = key
+        if versions:
+            default['versions'] = versions
+        if remote:
+            # TODO: in the future pull the secret via tty input like gpg
+            match = re.match(r'^s3://([A-Z0-9]+):([^@]+)@([a-z0-9-]+)/?(.*)$', remote)
+            if not match:
+                self.ABORT("Unrecognized REMOTE definition")
+            s3_path = match.group(4)
+            default['remote'] = {
+                'type':'s3',
+                'key':match.group(1),
+                'secret':match.group(2),
+                'bucket':match.group(3),
+                'path':s3_path
+            }
+
+        if not 'remote' in default.keys():
+            self.ABORT("Must specify --remote")
+        self.cfg['files'][name] = default
+        print(json.dumps(self.cfg, indent=2))
+        self.cfg_save()
+        self.NOTICE("File '" + name + "' defined")
+        if path:
+            if not os.path.exists(path):
+                self.ABORT("Cannot find file: " + path)
+            self.NOTICE("Uploading '" + name + "'")
+            with open(path, 'rt') as file_h:
+                remoteFile(self).put(name, file_h, force)
+
+    ############################################################
+    def remove_file_cli(self, name, forced):
+        if not forced:
+            self.ABORT("Specify --force to delete a file and all of its versions")
+        self.NOTICE("Deleting '" + name + "' and all of its stored files:")
+        remote = remoteFile(self)
+        map(lambda s: print("    " + s.name), remote.list(name))
+        self.NOTICE("Waiting 5 seconds...")
+        time.sleep(5)
+        for key in remote.list(name):
+            self.NOTICE("rm " + key.name)
+            remote.delete(key.name)
+        del self.cfg['files'][name]
+        self.cfg_save()
+
+    ############################################################
+    def open_cli(self, name, search=[], edit=False, force=False, version=None):
+        if not name in self.cfg['files'].keys():
+            self.ABORT("You have not defined a file named '" + name + "'")
+        self.NOTICE("Editing '" + name + "'")
+        remote = remoteFile(self)
+        try:
+            remote.lock_acquire(name, force=force)
+        except Exception, e:
+            self.ABORT(str(e))
+
+        created = True
+        if version:
+            matches = remote.list_names(name, filter=version)
+            if len(matches) > 1:
+                self.NOTICE("Matches:")
+                map(self.NOTICE, remote.format_list(matches))
+                self.ABORT("Too many matches to version=" + version)
+            elif len(matches) == 0:
+                self.ABORT("No matches for version=" + version)
+            else:
+                target = matches[0].split('/')[-1]
+                created = False
+        else:
+            target = remote.list_names(name)[-1].split('/')[-1]
+
+        localdir = self.homedir + '/.safe.' + name
+        if not os.path.exists(localdir):
+            os.mkdir(localdir)
+        # always reset the privs
+        os.chmod(localdir, stat.S_IRWXU)
+        localfile = localdir + '/' + target
+        if not os.path.exists(localfile):
+            try:
+                file_h = open(localfile, 'wb')
+                full = remote.full_path(name, fname=target)
+                remote.get(name, remote.full_path(name, fname=target), file_h)
+                file_h.close()
+            except Exception, e:
+                self.ABORT("Unable to open file (" + localfile + "): " + str(e))
+
+        # TODO: set read-only option if !created
+        subprocess.call(['vim', localfile])
+        if created:
+            with open(localfile, 'rb') as file_h:
+                remote.put(name, file_h, lock=False)
+        else:
+            self.NOTICE("Not uploading changes")
+
+        remote.lock_release(name)
+
+################################################################
+def main():
+    def helpDoc(**args):
+        print(syntax())
+        sys.exit(0)
+
+    def syntax():
+        cmd = os.path.basename(__file__)
+        return '''
+Safe manages secure documents for you, stored centrally, and versioned
+It is used differently depending upon what you desire to do:
+
+Register an existing remote file:
+  ''' + cmd + ''' -c/--config=NAME [config args]
+
+  [config args] are any of:
+    --key, --encoder, --versions, --remote, --seed
+
+Add a new file:
+  ''' + cmd + ''' -c/--config=NAME -f/--file=FILE [config args]
+
+See existing configuration:
+  ''' + cmd + ''' -c/--config
+
+List files:
+  ''' + cmd + ''' -ls/--list
+
+Delete a file:
+  ''' + cmd + ''' --delete=NAME
+
+View the latest file:
+  ''' + cmd + ''' NAME
+
+Search the latest file for MATCH:
+  ''' + cmd + ''' NAME MATCH
+
+Edit the latest file:
+  ''' + cmd + ''' NAME --e?dit
+
+Other options:
+  --force      required for some actions
+  -d/--debug=m enable debuging of module (m), may be specified multiple times
+               modules: base, remoteFile, http
+  --encoder=x  specify an alternate encoder from gpg+vim.  None is acceptable.
+  --key=k      specify the key to use with the editor (such as the gpg key)
+  --version=v  specify a specific version to view (look at --ls)
+  --versions=x specify how many versions to keep with --add, default: 50
+  --remote=def specify the remote registry, format:
+                    s3://API_KEY:API_SECRET@BUCKET/PATH
+ '''
+
+    parser = argparse.ArgumentParser(add_help=False, usage=syntax())
+    parser.add_argument("--help", "-h", action='store_true')
+    parser.add_argument("--debug", "-d", action='append')
+    parser.add_argument("--remote", "-r", action='store')
+    parser.add_argument("--config", "--configure", "-c", nargs='*')
+    parser.add_argument("--list", "-ls", '--ls', action='store_true', dest='ls')
+    parser.add_argument("--seed", action='store')
+    parser.add_argument("--remove", action='store')
+    parser.add_argument("--file", "-f", action='store', dest='path')
+    parser.add_argument("--force", action='store_true')
+    parser.add_argument("--version", action='store')
+    parser.add_argument("--versions", action='store', type=int)
+    parser.add_argument("--edit", action='store_true')
+    parser.add_argument("--encoder", action='store')
+    parser.add_argument("--key", action='store')
+    parser.add_argument("file", nargs='*')
+    parser.add_argument("search", nargs='*')
+
+    args = parser.parse_args()
+    cli = CLI(debug=args.debug).cfg_load()
+
+    if args.help:
+        helpDoc()
+    elif args.config == []:
+        cli.config_print_cli()
+    elif args.config != None:
+        cli.config_cli(args.config[0], versions=args.versions, path=args.path,
+                       force=args.force, encoder=args.encoder, key=args.key,
+                       remote=args.remote)
+    elif args.ls:
+        cli.list_cli()
+    elif args.remove:
+        cli.remove_file_cli(args.remove, args.force)
+    elif len(args.file) == 0:
+        print(syntax())
+        cli.ABORT("Missing file NAME")
+    else:
+        cli.open_cli(args.file[0], search=args.search, edit=args.edit, force=args.force,
+                     version=args.version)
+
+if __name__ == "__main__":
+    main()
+
