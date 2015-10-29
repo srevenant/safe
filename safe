@@ -341,9 +341,8 @@ class remoteFile(Base):
         key = self.key(name, fname=self.full_path(name, fname=vers_name))
         self.DEBUG("put(" + name + " as " + key.key + ")", module="remoteFile")
         # encrypt it
-        efile = source_file + ",e"
-        #
-        key.set_contents_from_file(fp=efile, replace=False)
+        with open(key + ",e", 'rb') as file_h:
+            key.set_contents_from_file(fp=efile, replace=False)
         self.clean_old(name)
         if lock:
             self.lock_release(name)
@@ -442,8 +441,6 @@ class remoteFile(Base):
         self.DEBUG("list(" + name + ", prefix=" + str(prefix) + ")", module="remoteFile")
         bucket = self.connect(name)
         prefix = self.cfg['files'][name]['remote']['path']
-#        prefix = self.full_path(prefix)
-        #self.DEBUG("list(prefix=" + str(prefix) + ")", module="remoteFile")
         return bucket.list(prefix=prefix)
 
     ############################################################
@@ -474,8 +471,18 @@ class CLI(Base):
         """dump the config"""
         altcfg = self.cfg
         for e in altcfg['files']:
-            if 'secret' in altcfg['files'][e]['remote'].keys():
-                altcfg['files'][e]['remote']['secret'] = 'xxxxxxxxxxxxxxx'
+            rem = altcfg['files'][e]['remote']
+#            if 'secret' in rem.keys():
+#                rem['secret'] = 'xxxxxxxxxxxxxxx'
+            rem['file'] = e
+            s = "{file} --remote s3://{key}:{secret}@{bucket}/{path}".format(**rem)
+            if "key" in altcfg['files'].keys():
+                s += " --key=" + altcfg['files']['key']
+            if "versions" in altcfg['files'].keys():
+                s += " --versions=" + str(altcfg['files']['versions'])
+            if "encoder" in altcfg['files'].keys():
+                s += " --encoder=" + str(altcfg['files']['encoder'])
+            self.NOTICE("  safe -c " + s)
         self.NOTICE(json.dumps(altcfg, indent=2))
 
     ############################################################
@@ -483,8 +490,6 @@ class CLI(Base):
         """CLI Interface -- list files"""
         remote = remoteFile(self)
         for name in self.cfg['files'].keys():
-#            for e in remote.list_names(name, details=True):
-#                print(e.name + " " + e.last_modified)
             map(self.NOTICE, remote.format_list(remote.list_names(name, details=True),
                                                 detailed=True))
 
@@ -534,8 +539,7 @@ class CLI(Base):
             if not os.path.exists(path):
                 self.ABORT("Cannot find file: " + path)
             self.NOTICE("Uploading '" + name + "'")
-            with open(path, 'rt') as file_h:
-                remoteFile(self).put(name, file_h, force)
+            remoteFile(self).put(name, path, force)
 
     ############################################################
     def remove_file_cli(self, name, forced):
@@ -596,8 +600,7 @@ class CLI(Base):
         # TODO: set read-only option if !created
         subprocess.call(['vim', localfile])
         if created:
-            with open(localfile, 'rb') as file_h:
-                remote.put(name, file_h, lock=False)
+            remote.put(name, localfile, lock=False)
         else:
             self.NOTICE("Not uploading changes")
 
@@ -619,7 +622,7 @@ Register an existing remote file:
   ''' + cmd + ''' -c/--config=NAME [config args]
 
   [config args] are any of:
-    --key, --encoder, --versions, --remote, --seed
+    --remote, --versions, --key, --encoder
 
 Add a new file:
   ''' + cmd + ''' -c/--config=NAME -f/--file=FILE [config args]
