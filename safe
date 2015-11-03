@@ -340,7 +340,6 @@ class remoteFile(Base):
         efile = source_file + ",e"
         try:
             with open(efile, 'wt') as ef, open(source_file) as sf:
-                # HACK: get key
                 self.encrypt_file(self.cfg['files'][name]['key'], sf, ef)
             os.unlink(source_file)
             key.set_contents_from_filename(efile, replace=False)
