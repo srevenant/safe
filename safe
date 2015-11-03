@@ -104,17 +104,10 @@ class Core():
         sys.exit(1)
 
 ################################################################
-#def add(self, cfg, name, salt=None, password=None):
-#    cfg['files'][name] = {
-#        'password': base64.b64encode(password or ''),
-#        'salt': salt or base64.b64encode(os.urandom(16))
-#    }
-
 class Cipher(Core):
     versions = {
         '01': {'type':Fernet, 'blocksize': AES.block_size*1024}
     }
-    key = ''
     bs = 0
     cipher = None
 
@@ -125,8 +118,7 @@ class Cipher(Core):
             v = '01'
 
         self.bs = self.versions[v]['blocksize']
-        self.key = key
-        self.cipher = self.versions[v]['type'](self.key)
+        self.cipher = self.versions[v]['type'](str(key))
         return self
 
     def new_key(self):
@@ -139,6 +131,7 @@ class Cipher(Core):
             raise ValueError("self.cipher is not initialized")
 
     def encrypt_file(self, key, in_file, out_file):
+        self.DEBUG("encrypt({k}, <in>, <out>)".format(k=key), module="Cipher")
         self._prep(key)
         out_file.write('01')
         for block in self._read_block(in_file, self.bs):
@@ -315,55 +308,69 @@ class remoteFile(Base):
         result = bucket.delete_key(key_name)
 
     ############################################################
-    def get(self, name, key_name, local_file, version=None):
+    def get(self, name, key_name, localfile, version=None):
         """Download version of config from s3 bucket"""
-        self.DEBUG("get(" + name + ", " + key_name + ")", module="remoteFile")
+        self.DEBUG("get({n}, {k})".format(n=name, k=key_name), module="remoteFile")
         key = self.key(name, fname=self.full_path(name, fname=key_name))
-        key.get_contents_to_file(local_file)
-        #efile = local_file + ",e"
-        #key.get_contents_to_file(efile)
-        # decrypt
+        efile = localfile + ",e"
+        with open(efile, 'wt') as ef:
+            key.get_contents_to_file(ef)
+        with open(localfile, 'wt') as of, open(efile, 'rt') as ef:
+            self.decrypt_file(self.cfg['files'][name]['key'], ef, of)
 
     ############################################################
     def put(self, name, source_file, force=False, lock=True):
         """Upload a new config to s3"""
         if not len(name):
             self.ABORT("Cannot put without a name")
-        self.DEBUG("put({n}, fd, force={f}, lock={l}".format(n=name,f=force,l=lock),
-                   module="remoteFile")
+        self.DEBUG("put({n}, {s}, force={f}, lock={l}".format(n=name,
+                   s=source_file,f=force,l=lock), module="remoteFile")
         if lock:
             try:
                 self.lock_acquire(name, force=force)
             except Exception, e:
                 self.ABORT(str(e))
 
-        source_file.seek(0)
         vers_name = name + "," + self.TSTAMP() + "," + self.session
         key = self.key(name, fname=self.full_path(name, fname=vers_name))
-        self.DEBUG("put(" + name + " as " + key.key + ")", module="remoteFile")
+
+        self.DEBUG("encrypt", module="remoteFile")
 
         # encrypt it -- rewrite as I changed source_file from a file_name to a file handle
-        #efile = source_file + ",e"
-        #with open(efile, 'wt') as wf, open(source_file) as sf:
-        #    self.encrypt_file(key, sf, wf)
-        #with open(efile, 'rt') as outf:
-        #    key.set_contents_from_file(fp=outf, replace=False)
-
-        key.set_contents_from_file(fp=source_file, replace=False)
-        self.clean_old(name)
-        if lock:
+        efile = source_file + ",e"
+        try:
+            with open(efile, 'wt') as ef, open(source_file) as sf:
+                # HACK: get key
+                self.encrypt_file(self.cfg['files'][name]['key'], sf, ef)
+            os.unlink(source_file)
+            key.set_contents_from_filename(efile, replace=False)
+        except:
             self.lock_release(name)
+            raise
+        finally:
+            self.clean_old(name)
+            if lock:
+                self.lock_release(name)
 
     ############################################################
     def clean_old(self, name):
         # TODO: make sure only .e files are left behind on local disk
         self.DEBUG("clean_old(" + name + ")", module="remoteFile")
-        versions = self.cfg['files'][name]['versions']
+        c = self.cfg['files'][name]
+        versions = c['versions']
         names = self.list_names(name)
         while len(names) > versions:
             self.NOTICE("Cleaning old version: " + names[0].split(',')[1])
             self.delete(name, names[0])
             names = self.list_names(name)
+
+        # keep less local copies
+        #-while len(names) > 2:
+        try:
+            for f in sorted(os.listdir(self.homedir + '/.safe.' + name)):
+                print(f)
+        except Exception, e:
+            print("Failure during clean: " + str(e))
 
         #os path list | sort by age
         #while len(names) > vers:
@@ -487,8 +494,8 @@ class CLI(Base):
         altcfg = self.cfg
         for e in altcfg['files']:
             rem = altcfg['files'][e]['remote']
-            if 'secret' in rem.keys():
-                rem['secret'] = 'xxxxxxxxxxxxxxx'
+#            if 'secret' in rem.keys():
+#                rem['secret'] = 'xxxxxxxxxxxxxxx'
             rem['file'] = e
             s = "{file} --remote s3://{key}:{secret}@{bucket}/{path}".format(**rem)
             if "key" in altcfg['files'].keys():
@@ -505,8 +512,6 @@ class CLI(Base):
         """CLI Interface -- list files"""
         remote = remoteFile(self)
         for name in self.cfg['files'].keys():
-#            for e in remote.list_names(name, details=True):
-#                print(e.name + " " + e.last_modified)
             map(self.NOTICE, remote.format_list(remote.list_names(name, details=True),
                                                 detailed=True))
 
@@ -514,6 +519,16 @@ class CLI(Base):
     def config_cli(self, name, path=None, force=False, encoder=None, key=None, versions=None, remote=None):
         if not force and name in self.cfg['files'].keys():
             self.ABORT("File '" + name + "' is already defined, specify --force to override")
+
+        # if a file path is defined, create new (generate key)
+        if path:
+            if not os.path.exists(path):
+                self.ABORT("Cannot find file: " + path)
+            if not key:
+                self.NOTICE("Generating key...")
+                key = Fernet.generate_key()
+
+        # specify attributes if they are defined
         if name in self.cfg['files'].keys():
             default = self.cfg['files'][name]
         else:
@@ -528,7 +543,9 @@ class CLI(Base):
             }
         if encoder:
             default['encoder'] = encoder
-        if key:
+        if key == "generate":
+            default['key'] = Fernet.generate_key()
+        elif key:
             default['key'] = key
         if versions:
             default['versions'] = versions
@@ -553,11 +570,10 @@ class CLI(Base):
         self.cfg_save()
         self.NOTICE("File '" + name + "' defined")
         if path:
-            if not os.path.exists(path):
-                self.ABORT("Cannot find file: " + path)
             self.NOTICE("Uploading '" + name + "'")
-            with open(path, 'rt') as file_h:
-                remoteFile(self).put(name, file_h, force)
+            remoteFile(self).put(name, path, force)
+#            with open(path, 'rt') as file_h:
+#                remoteFile(self).put(name, file_h, force)
 
     ############################################################
     def remove_file_cli(self, name, forced):
@@ -607,19 +623,18 @@ class CLI(Base):
         os.chmod(localdir, stat.S_IRWXU)
         localfile = localdir + '/' + target
         if not os.path.exists(localfile):
-            try:
-                file_h = open(localfile, 'wb')
-                full = remote.full_path(name, fname=target)
-                remote.get(name, remote.full_path(name, fname=target), file_h)
-                file_h.close()
-            except Exception, e:
-                self.ABORT("Unable to open file (" + localfile + "): " + str(e))
+#            try:
+#                file_h = open(localfile, 'wb')
+#                full = remote.full_path(name, fname=target)
+                remote.get(name, remote.full_path(name, fname=target), localfile)
+#                file_h.close()
+#            except Exception, e:
+#                self.ABORT("Unable to open file (" + localfile + "): " + str(e))
 
         # TODO: set read-only option if !created
         subprocess.call(['vim', localfile])
         if created:
-            with open(localfile, 'rb') as file_h:
-                remote.put(name, file_h, lock=False)
+            remote.put(name, localfile, lock=False)
         else:
             self.NOTICE("Not uploading changes")
 
@@ -688,7 +703,7 @@ Other options:
     parser.add_argument("--force", action='store_true')
     parser.add_argument("--version", action='store')
     parser.add_argument("--versions", action='store', type=int)
-    parser.add_argument("--edit", action='store_true')
+    parser.add_argument("--edit", "-e", action='store_true')
     parser.add_argument("--encoder", action='store')
     parser.add_argument("--key", action='store')
     parser.add_argument("file", nargs='*')
