@@ -95,6 +95,7 @@ class Core():
 
     ############################################################
     def ABORT(self, msg, err=None):
+        """standardized failure"""
         if err:
             self.DEBUG("Error", err=err)
         self.NOTICE("ABORT: " + msg)
@@ -105,13 +106,16 @@ class Core():
 
 ################################################################
 class Cipher(Core):
+"""Standardized Encryption"""
     versions = {
         '01': {'type':Fernet, 'blocksize': AES.block_size*1024}
     }
     bs = 0
     cipher = None
 
+    ############################################################
     def _prep(self, key, orig=None):
+        """prepare encryption"""
         if orig:
             v = orig[:2]
         else:
@@ -121,15 +125,19 @@ class Cipher(Core):
         self.cipher = self.versions[v]['type'](str(key))
         return self
 
+    ############################################################
     def new_key(self):
+        """return a key to our standard format"""
         return Fernet.generate_key()
 
+    ############################################################
     def encrypt(self, block):
         if self.cipher:
             return self.cipher.encrypt(block)
         else:
             raise ValueError("self.cipher is not initialized")
 
+    ############################################################
     def encrypt_file(self, key, in_file, out_file):
         self.DEBUG("encrypt({k}, <in>, <out>)".format(k=key), module="Cipher")
         self._prep(key)
@@ -139,12 +147,14 @@ class Cipher(Core):
             out_file.write(self.cipher.encrypt(block))
             out_file.write("\n")
 
+    ############################################################
     def decrypt(self, block):
         if self.cipher:
             return self.cipher.decrypt(block)
         else:
             raise ValueError("self.cipher is not initialized")
 
+    ############################################################
     def decrypt_file(self, key, in_file, out_file):
         first = in_file.read(2)
         self._prep(key, orig=first)
@@ -152,16 +162,21 @@ class Cipher(Core):
         for block in in_file: # self._read_block(in_file, self.bs):
             out_file.write(self.cipher.decrypt(block))
 
-    def _read_block(self, read_file, bs):
-        while True:
-            data = read_file.read(bs)
-            if not data:
-                break
-            yield data
+    # may use in the future
+    #def _read_block(self, read_file, bs):
+    #    while True:
+    #        data = read_file.read(bs)
+    #        if not data:
+    #            break
+    #        yield data
 
 ################################################################
 class Base(Cipher):
-    """Base object where common and global attributes are defined"""
+    """
+    Base object where common and global attributes are defined.
+    All remote files are defined with a unique name, which is
+    referenced in the configuration to pull other attributes.
+    """
     cfg_path = os.environ['HOME'] + '/.safe'
     cfg_secret = os.environ['HOME'] + '/.safe.s'
     cfg = {'files':{}}
@@ -177,8 +192,8 @@ class Base(Cipher):
         sys.exit(1)
 
     ############################################################
-    # find an executable
     def _which(self, cmd):
+        """search os path to find an executable"""
         for path in os.environ["PATH"].split(os.pathsep):
             full_cmd = os.path.join(path, cmd)
             if os.path.exists(full_cmd):
@@ -197,12 +212,17 @@ class Base(Cipher):
         self.session = reference.session
 
     ############################################################
-    # python class inheritance and instantiation is brain-dead
-    # break out our class Init so we can bypass super()
     def __init__(self, debug=[]):
+        """
+        Use .__init_Base__ because python class inheritance has
+        the brain worms, use a custom init instead.
+        """
         self.__init_Base__(debug)
 
     def __init_Base__(self, debug=[]):
+        """
+        Allows us to discretely initialize as required.
+        """
         if debug:
             for module in debug:
                 self.debug[module] = True
@@ -223,7 +243,7 @@ class Base(Cipher):
 
     ############################################################
     def StringIO(self):
-        # because python 2.x does unicode with io.StringIO
+        """Used because python 2.x does unicode with io.StringIO"""
         if sys.version_info[0] < 3:
             return StringIO.StringIO()
         else:
@@ -231,7 +251,7 @@ class Base(Cipher):
 
     ############################################################
     def cfg_load(self):
-        """Load state config data"""
+        """Load config file (encrypted)"""
         try:
             self.DEBUG("Config Load:", data=self.cfg, module='config')
             if os.path.exists(self.cfg_path):
@@ -250,7 +270,7 @@ class Base(Cipher):
 
     ############################################################
     def cfg_save(self):
-        """Save config to file"""
+        """Save config file (encrypted)"""
         decrypted_file = io.BytesIO()
         decrypted_file.write(json.dumps(self.cfg))
         decrypted_file.seek(0)
@@ -263,10 +283,11 @@ class Base(Cipher):
 
 ################################################################
 class remoteFile(Base):
+    """Manage remote file interfacing"""
 
     ############################################################
     def __init__(self, base, debug=[]):
-        """instantiate with key and secret)"""
+        """Instantiate with reference object, copy attributes"""
         # this object is always called as a reference to Base,
         # not a direct inheritor
         base and self.__reference__(base)
@@ -274,6 +295,7 @@ class remoteFile(Base):
 
     ############################################################
     def connect(self, name):
+        """Connect to a remote source (s3)"""
         self.DEBUG("connect(" + name + ")", module="remoteFile")
         if not name in self.opened.keys():
             if not name in self.cfg['files'].keys():
@@ -293,6 +315,7 @@ class remoteFile(Base):
 
     ############################################################
     def key(self, key_name, fname=None):
+        """Common wrapper to get a key for s3"""
         self.DEBUG("key(" + key_name + ", fname=" + str(fname) + ")", module="remoteFile")
         if not fname:
             fname = key_name
@@ -302,14 +325,14 @@ class remoteFile(Base):
 
     ############################################################
     def delete(self, name, key_name):
-        """receive a complete name,version key and delete it"""
+        """receive a discrete key (with version) and delete it"""
         self.DEBUG("delete(" + name + ", " + key_name + ")", module="remoteFile")
         bucket = self.connect(name)
         result = bucket.delete_key(key_name)
 
     ############################################################
     def get(self, name, key_name, localfile, version=None):
-        """Download version of config from s3 bucket"""
+        """Download version of file from s3 bucket"""
         self.DEBUG("get({n}, {k})".format(n=name, k=key_name), module="remoteFile")
         key = self.key(name, fname=self.full_path(name, fname=key_name))
         efile = localfile + ",e"
@@ -320,7 +343,10 @@ class remoteFile(Base):
 
     ############################################################
     def put(self, name, source_file, force=False, lock=True):
-        """Upload a new config to s3"""
+        """
+        Upload a file to s3.  Process encoding and encrypt to file
+        configuration requirements.
+        """
         if not len(name):
             self.ABORT("Cannot put without a name")
         self.DEBUG("put({n}, {s}, force={f}, lock={l}".format(n=name,
@@ -333,8 +359,6 @@ class remoteFile(Base):
 
         vers_name = name + "," + self.TSTAMP() + "," + self.session
         key = self.key(name, fname=self.full_path(name, fname=vers_name))
-
-        self.DEBUG("encrypt", module="remoteFile")
 
         # encrypt it -- rewrite as I changed source_file from a file_name to a file handle
         efile = source_file + ",e"
@@ -353,6 +377,7 @@ class remoteFile(Base):
 
     ############################################################
     def clean_old(self, name):
+        """Cleanup old versions, remote and locally."""
         # TODO: make sure only .e files are left behind on local disk
         self.DEBUG("clean_old(" + name + ")", module="remoteFile")
         c = self.cfg['files'][name]
@@ -379,6 +404,7 @@ class remoteFile(Base):
 
     ############################################################
     def lock_name(self, target):
+        """Get the file name to use for a lock."""
         self.DEBUG("lock_name(" + target + ")", module="remoteFile")
         rdef = self.cfg['files'][target]['remote']
         return rdef['path'] + '/lock:' + target
@@ -414,7 +440,10 @@ class remoteFile(Base):
 
     ############################################################
     def lock_set(self, key, force=False):
-        """Set a lock--do not check to see if it exists first; called by lock_acquire()"""
+        """
+        Set a lock--do not check to see if it exists first.
+        Called by lock_acquire()
+        """
         self.DEBUG("lock_set(" + key.name + ", force=" + str(force) + ")",
                    module="remoteFile")
         lockfile = self.StringIO()
@@ -439,6 +468,7 @@ class remoteFile(Base):
 
     ############################################################
     def format_list(self, list, detailed=True):
+        """Receive a list of remote files, format it and return."""
         self.DEBUG("format_list()", module="remoteFile")
         out = []
         for v in list:
@@ -457,15 +487,15 @@ class remoteFile(Base):
 
     ############################################################
     def list(self, name, prefix=None):
+        """Return a list of remote files as keys, matching file name"""
         self.DEBUG("list(" + name + ", prefix=" + str(prefix) + ")", module="remoteFile")
         bucket = self.connect(name)
         prefix = self.cfg['files'][name]['remote']['path']
-#        prefix = self.full_path(prefix)
-        #self.DEBUG("list(prefix=" + str(prefix) + ")", module="remoteFile")
         return bucket.list(prefix=prefix)
 
     ############################################################
     def list_names(self, name, filter=None, details=False):
+        """Return a list of remote files as names, matching file name"""
         self.DEBUG("list_names(" + name + ", filter=" + str(filter) + ")", module="remoteFile")
         path = self.full_path(name)
         rx = re.compile(path + ",([0-9]{14}|[0-9_:-]{19}),.*$")
@@ -489,7 +519,7 @@ class CLI(Base):
 
     ############################################################
     def config_print_cli(self):
-        """dump the config"""
+        """Print the config."""
         altcfg = self.cfg
         for e in altcfg['files']:
             rem = altcfg['files'][e]['remote']
@@ -511,11 +541,12 @@ class CLI(Base):
         """CLI Interface -- list files"""
         remote = remoteFile(self)
         for name in self.cfg['files'].keys():
-            map(self.NOTICE, remote.format_list(remote.list_names(name, details=True),
-                                                detailed=True))
+            map(self.NOTICE, remote.format_list(
+                remote.list_names(name, details=True), detailed=True))
 
     ############################################################
     def config_cli(self, name, path=None, force=False, encoder=None, key=None, versions=None, remote=None):
+        """Update / Define / Configure a file in local config"""
         if not force and name in self.cfg['files'].keys():
             self.ABORT("File '" + name + "' is already defined, specify --force to override")
 
@@ -525,7 +556,7 @@ class CLI(Base):
                 self.ABORT("Cannot find file: " + path)
             if not key:
                 self.NOTICE("Generating key...")
-                key = Fernet.generate_key()
+                key = self.new_key()
 
         # specify attributes if they are defined
         if name in self.cfg['files'].keys():
@@ -543,7 +574,7 @@ class CLI(Base):
         if encoder:
             default['encoder'] = encoder
         if key == "generate":
-            default['key'] = Fernet.generate_key()
+            default['key'] = self.new_key()
         elif key:
             default['key'] = key
         if versions:
@@ -571,11 +602,10 @@ class CLI(Base):
         if path:
             self.NOTICE("Uploading '" + name + "'")
             remoteFile(self).put(name, path, force)
-#            with open(path, 'rt') as file_h:
-#                remoteFile(self).put(name, file_h, force)
 
     ############################################################
     def remove_file_cli(self, name, forced):
+        """Remove a file from configuration"""
         if not forced:
             self.ABORT("Specify --force to delete a file and all of its versions")
         self.NOTICE("Deleting '" + name + "' and all of its stored files:")
@@ -591,6 +621,7 @@ class CLI(Base):
 
     ############################################################
     def open_cli(self, name, search=[], edit=False, force=False, version=None):
+        """Open and optionally edit a file, using latest remote version."""
         if not name in self.cfg['files'].keys():
             self.ABORT("You have not defined a file named '" + name + "'")
         self.NOTICE("Editing '" + name + "'")
@@ -622,15 +653,9 @@ class CLI(Base):
         os.chmod(localdir, stat.S_IRWXU)
         localfile = localdir + '/' + target
         if not os.path.exists(localfile):
-#            try:
-#                file_h = open(localfile, 'wb')
-#                full = remote.full_path(name, fname=target)
-                remote.get(name, remote.full_path(name, fname=target), localfile)
-#                file_h.close()
-#            except Exception, e:
-#                self.ABORT("Unable to open file (" + localfile + "): " + str(e))
+            remote.get(name, remote.full_path(name, fname=target), localfile)
 
-        # TODO: set read-only option if !created
+        # TODO: set read-only option in editor if !created
         subprocess.call(['vim', localfile])
         if created:
             remote.put(name, localfile, lock=False)
