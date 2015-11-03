@@ -44,6 +44,7 @@ import tempfile
 import signal
 import sys
 import subprocess
+from subprocess import Popen,PIPE
 import atexit # shutdown hooks
 import shutil # rm -rf (rmtree)
 import uuid
@@ -52,9 +53,6 @@ from cryptography.fernet import Fernet,MultiFernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-
-################################################################
-# TODO: cleanup the odd case that we have something left over?
 
 ################################################################
 class Core():
@@ -106,7 +104,7 @@ class Core():
 
 ################################################################
 class Cipher(Core):
-"""Standardized Encryption"""
+    """Standardized Encryption"""
     versions = {
         '01': {'type':Fernet, 'blocksize': AES.block_size*1024}
     }
@@ -162,13 +160,12 @@ class Cipher(Core):
         for block in in_file: # self._read_block(in_file, self.bs):
             out_file.write(self.cipher.decrypt(block))
 
-    # may use in the future
-    #def _read_block(self, read_file, bs):
-    #    while True:
-    #        data = read_file.read(bs)
-    #        if not data:
-    #            break
-    #        yield data
+    def _read_block(self, read_file, bs):
+        while True:
+            data = read_file.read(bs)
+            if not data:
+                break
+            yield data
 
 ################################################################
 class Base(Cipher):
@@ -331,18 +328,48 @@ class remoteFile(Base):
         result = bucket.delete_key(key_name)
 
     ############################################################
-    def get(self, name, key_name, localfile, version=None):
+    def get(self, name, key_name, localfile, version=None, stdout=False, search=None):
         """Download version of file from s3 bucket"""
         self.DEBUG("get({n}, {k})".format(n=name, k=key_name), module="remoteFile")
         key = self.key(name, fname=self.full_path(name, fname=key_name))
-        efile = localfile + ",e"
+        efile = localfile + ",e" # encrypted
+        gfile = localfile + ".gpg" # interim encoded(gpg)
         with open(efile, 'wt') as ef:
             key.get_contents_to_file(ef)
-        with open(localfile, 'wt') as of, open(efile, 'rt') as ef:
+        with open(localfile + ".gpg", 'wt') as of, open(efile, 'rt') as ef:
             self.decrypt_file(self.cfg['files'][name]['key'], ef, of)
 
+        # spaghetti to handle the various options for output/editing
+        gpghome = self.cfg['files'][name]['gpghome']
+        if gpghome:
+            gpg = ['gpg', "--homedir", gpghome]
+            if not stdout:
+                gpg += ["--output", localfile]
+            gpg += ["-d", gfile]
+            if search:
+                gpg = Popen(gpg, stdout=PIPE)
+                grep = Popen(["grep"] + search, stdin=gpg.stdout)
+                gpg.stdout.close() # Allow p1 to receive a SIGPIPE if p2 exits.
+                grep.communicate()
+            else:
+                subprocess.call(gpg)
+        else:
+            if not stdout:
+                subprocess.call(['cp', gfile, localfile])
+            else:
+                if search:
+                    subprocess.call(["grep"] + search)
+                else:
+                    subprocess.call(['cat', gfile])
+
     ############################################################
-    def put(self, name, source_file, force=False, lock=True):
+    # easy way to disable unlinking for debugging
+    def unlink(self, path):
+        os.unlink(path)
+        #pass
+
+    ############################################################
+    def put(self, name, localfile, force=False, lock=True):
         """
         Upload a file to s3.  Process encoding and encrypt to file
         configuration requirements.
@@ -350,7 +377,7 @@ class remoteFile(Base):
         if not len(name):
             self.ABORT("Cannot put without a name")
         self.DEBUG("put({n}, {s}, force={f}, lock={l}".format(n=name,
-                   s=source_file,f=force,l=lock), module="remoteFile")
+                   s=localfile,f=force,l=lock), module="remoteFile")
         if lock:
             try:
                 self.lock_acquire(name, force=force)
@@ -360,39 +387,40 @@ class remoteFile(Base):
         vers_name = name + "," + self.TSTAMP() + "," + self.session
         key = self.key(name, fname=self.full_path(name, fname=vers_name))
 
-        # encrypt it -- rewrite as I changed source_file from a file_name to a file handle
-        efile = source_file + ",e"
+        # gpg encode 
+        efile = localfile + ",e"
+        gfile = localfile + ".gpg"
+        gpghome = self.cfg['files'][name]['gpghome']
+        self.unlink(gfile)
+        if gpghome:
+            gpgkey = self.cfg['files'][name]['gpgkey']
+            subprocess.call(['gpg', "--homedir", gpghome, "-r", gpgkey, "-e", localfile])
+        else:
+            subprocess.call(['cp', localfile, gfile])
         try:
-            with open(efile, 'wt') as ef, open(source_file) as sf:
+            with open(efile, 'wt') as ef, open(gfile) as sf:
                 self.encrypt_file(self.cfg['files'][name]['key'], sf, ef)
-            os.unlink(source_file)
+            self.unlink(localfile)
+            self.unlink(gfile)
             key.set_contents_from_filename(efile, replace=False)
         except:
             self.lock_release(name)
             raise
         finally:
-            self.clean_old(name)
+            self.clean_remote(name)
             if lock:
                 self.lock_release(name)
 
     ############################################################
-    def clean_old(self, name):
-        """Cleanup old versions, remote and locally."""
-        # TODO: make sure only .e files are left behind on local disk
-        self.DEBUG("clean_old(" + name + ")", module="remoteFile")
-        c = self.cfg['files'][name]
-        versions = c['versions']
-        names = self.list_names(name)
-        while len(names) > versions:
-            self.NOTICE("Cleaning old version: " + names[0].split(',')[1])
-            self.delete(name, names[0])
-            names = self.list_names(name)
-
+    def clean_local(self, name):
+        """Cleanup local scratch files"""
         # keep less local copies
         #-while len(names) > 2:
         try:
-            for f in sorted(os.listdir(self.homedir + '/.safe.' + name)):
-                print(f)
+            # for now unlink everything, no local copies
+            basedir = self.homedir + '/.safe.' + name
+            for f in sorted(os.listdir(basedir)):
+                self.unlink(basedir + "/" + f)
         except Exception, e:
             print("Failure during clean: " + str(e))
 
@@ -401,6 +429,20 @@ class remoteFile(Base):
         #  unlink()
         #  list_names
         # TODO: cleanup local files too
+
+    ############################################################
+    def clean_remote(self, name):
+        """Cleanup old versions, remote."""
+        # TODO: make sure only .e files are left behind on local disk
+        self.DEBUG("clean_remote(" + name + ")", module="remoteFile")
+        c = self.cfg['files'][name]
+        versions = c['versions']
+        names = self.list_names(name)
+        while len(names) > versions:
+            self.NOTICE("Cleaning old version: " + names[0].split(',')[1])
+            self.delete(name, names[0])
+            names = self.list_names(name)
+        self.clean_local(name)
 
     ############################################################
     def lock_name(self, target):
@@ -412,6 +454,7 @@ class remoteFile(Base):
     ############################################################
     def lock_release(self, target):
         """Release a lock"""
+        self.NOTICE("Releasing Lock for " + target)
         self.DEBUG("lock_release(" + target + ")", module="remoteFile")
         self.delete(target, self.lock_name(target))
 
@@ -420,6 +463,7 @@ class remoteFile(Base):
         """Acquire a lock"""
         self.DEBUG("lock_acquire(" + target + ", force=" + str(force) + ")",
                    module="remoteFile")
+        self.NOTICE("Acquiring Lock for " + target)
         key = self.key(target, fname=self.lock_name(target))
         if force:
             return self.lock_set(key, force=force)
@@ -531,8 +575,8 @@ class CLI(Base):
                 s += " --key=" + altcfg['files']['key']
             if "versions" in altcfg['files'].keys():
                 s += " --versions=" + str(altcfg['files']['versions'])
-            if "encoder" in altcfg['files'].keys():
-                s += " --encoder=" + str(altcfg['files']['encoder'])
+            if "gpghome" in altcfg['files'].keys():
+                s += " --gpghome=" + str(altcfg['files']['gpghome'])
             self.NOTICE("  safe -c " + s)
         self.NOTICE(json.dumps(altcfg, indent=2))
 
@@ -545,7 +589,7 @@ class CLI(Base):
                 remote.list_names(name, details=True), detailed=True))
 
     ############################################################
-    def config_cli(self, name, path=None, force=False, encoder=None, key=None, versions=None, remote=None):
+    def config_cli(self, name, path=None, force=False, key=None, gpghome=None, versions=None, remote=None, gpgkey=None):
         """Update / Define / Configure a file in local config"""
         if not force and name in self.cfg['files'].keys():
             self.ABORT("File '" + name + "' is already defined, specify --force to override")
@@ -562,17 +606,20 @@ class CLI(Base):
         if name in self.cfg['files'].keys():
             default = self.cfg['files'][name]
         else:
-            if not encoder:
-                encoder = 'gpg'
+            if not gpghome:
+                gpghome = None
             if not versions:
                 versions = 50
             default = {
-                'encoder':encoder,
+                'gpghome':gpghome,
                 'key':key,
                 'versions':versions,
             }
-        if encoder:
-            default['encoder'] = encoder
+        if gpghome or gpgkey:
+            if not gpghome or not gpgkey:
+                self.ABORT("both --gpghome and --gpgkey must be defined together")
+            default['gpghome'] = gpghome
+            default['gpgkey'] = gpgkey
         if key == "generate":
             default['key'] = self.new_key()
         elif key:
@@ -620,16 +667,20 @@ class CLI(Base):
         self.cfg_save()
 
     ############################################################
-    def open_cli(self, name, search=[], edit=False, force=False, version=None):
+    def open_cli(self, name, search=[], edit=False, editor=False, force=False, version=None):
         """Open and optionally edit a file, using latest remote version."""
         if not name in self.cfg['files'].keys():
             self.ABORT("You have not defined a file named '" + name + "'")
-        self.NOTICE("Editing '" + name + "'")
+
         remote = remoteFile(self)
-        try:
-            remote.lock_acquire(name, force=force)
-        except Exception, e:
-            self.ABORT(str(e))
+        if edit:
+            self.NOTICE("Editing '" + name + "'")
+            try:
+                remote.lock_acquire(name, force=force)
+            except Exception, e:
+                self.ABORT(str(e))
+        else:
+            self.NOTICE("Viewing '" + name + "'")
 
         created = True
         if version:
@@ -649,29 +700,41 @@ class CLI(Base):
         localdir = self.homedir + '/.safe.' + name
         if not os.path.exists(localdir):
             os.mkdir(localdir)
+
         # always reset the privs
         os.chmod(localdir, stat.S_IRWXU)
         localfile = localdir + '/' + target
         if not os.path.exists(localfile):
-            remote.get(name, remote.full_path(name, fname=target), localfile)
+            remote.get(name, remote.full_path(name, fname=target), localfile, search=search, stdout = not editor)
 
-        # TODO: set read-only option in editor if !created
-        subprocess.call(['vim', localfile])
-        if created:
-            remote.put(name, localfile, lock=False)
+        keep = False
+        if editor:
+            # TODO: set read-only option in editor if !created
+            s = subprocess.call(['vim', localfile])
+
+            if edit:
+                # inquire if user wants to upload
+                answer = raw_input("Commit changes? [y] ")
+                if not len(answer) or re.match("^(yes|y)$", answer, flags=re.IGNORECASE):
+                    remote.put(name, localfile, lock=False)
+                    keep = True
+            else:
+                self.NOTICE("Not uploading changes")
+
+        if keep:
+            remote.clean_remote(name)
         else:
-            self.NOTICE("Not uploading changes")
-
+            remote.clean_local(name)
         remote.lock_release(name)
 
 ################################################################
 def main():
+    cmd = os.path.basename(__file__)
     def helpDoc(**args):
         print(syntax())
         sys.exit(0)
 
     def syntax():
-        cmd = os.path.basename(__file__)
         return '''
 Safe manages secure documents for you, stored centrally, and versioned
 It is used differently depending upon what you desire to do:
@@ -680,10 +743,13 @@ Register an existing remote file:
   ''' + cmd + ''' -c/--config=NAME [config args]
 
   [config args] are any of:
-    --remote, --versions, --key, --encoder
+    --remote, --versions, --gpghome, --key
 
 Add a new file:
   ''' + cmd + ''' -c/--config=NAME -f/--file=FILE [config args]
+
+Define GPG encoding:
+  ''' + cmd + ''' -c/--config NAME --gpghome=PATH --gpgkey=NAME
 
 See existing configuration:
   ''' + cmd + ''' -c/--config
@@ -707,14 +773,18 @@ Other options:
   --force      required for some actions
   -d/--debug=m enable debuging of module (m), may be specified multiple times
                modules: base, remoteFile, http
-  --encoder=x  specify an alternate encoder from gpg+vim.  None is acceptable.
-  --key=k      specify the key to use with the editor (such as the gpg key)
+  --gpghome=x  Define the gpghome; if undefined, not encoded.
+  --gpgkey=x   Define the gpgkey name used for gpg encryption.
   --version=v  specify a specific version to view (look at --ls)
   --versions=x specify how many versions to keep with --add, default: 50
   --remote=def specify the remote registry, format:
                     s3://API_KEY:API_SECRET@BUCKET/PATH
  '''
 
+    if cmd == "visafe":
+        editor = True
+    else:
+        editor = False
     parser = argparse.ArgumentParser(add_help=False, usage=syntax())
     parser.add_argument("--help", "-h", action='store_true')
     parser.add_argument("--debug", "-d", action='append')
@@ -728,10 +798,10 @@ Other options:
     parser.add_argument("--version", action='store')
     parser.add_argument("--versions", action='store', type=int)
     parser.add_argument("--edit", "-e", action='store_true')
-    parser.add_argument("--encoder", action='store')
+    parser.add_argument("--gpghome", action='store')
+    parser.add_argument("--gpgkey", action='store')
     parser.add_argument("--key", action='store')
     parser.add_argument("file", nargs='*')
-    parser.add_argument("search", nargs='*')
 
     args = parser.parse_args()
     cli = CLI(debug=args.debug).cfg_load()
@@ -742,8 +812,8 @@ Other options:
         cli.config_print_cli()
     elif args.config != None:
         cli.config_cli(args.config[0], versions=args.versions, path=args.path,
-                       force=args.force, encoder=args.encoder, key=args.key,
-                       remote=args.remote)
+                       force=args.force, gpghome=args.gpghome, key=args.key,
+                       remote=args.remote, gpgkey=args.gpgkey)
     elif args.ls:
         cli.list_cli()
     elif args.remove:
@@ -752,8 +822,9 @@ Other options:
         print(syntax())
         cli.ABORT("Missing file NAME")
     else:
-        cli.open_cli(args.file[0], search=args.search, edit=args.edit, force=args.force,
-                     version=args.version)
+        search = args.file[1:]
+        cli.open_cli(args.file[0], search=search, edit=args.edit, force=args.force,
+                     version=args.version, editor=editor)
 
 if __name__ == "__main__":
     main()
